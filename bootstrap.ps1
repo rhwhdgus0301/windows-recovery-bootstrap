@@ -7,11 +7,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $interventions = New-Object System.Collections.Generic.List[string]
+function Select-LatestReady($Snapshots) {
+    return @($Snapshots | Where-Object { $_.tags -contains 'recovery-ready' } |
+        Sort-Object { [datetimeoffset]$_.time } -Descending)[0]
+}
+function Test-KitPath([string]$File) {
+    return ($File -match '^05_System/(?:config|scripts)/[A-Za-z0-9_./-]+$' -and
+            $File -notmatch '(^|/)\.\.(/|$)')
+}
 if ($Mode -eq 'SelfTest') {
     $selfHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
     if ($selfHash -notmatch '^[A-F0-9]{64}$') { throw 'SHA-256 self-test failed' }
+    if ($ExpectedSha256 -and $selfHash -ine $ExpectedSha256) { throw 'Bootstrap SHA-256 mismatch' }
     if ('../escape' -match '^\d{8}T\d{6}Z-[0-9a-f]{12}$') { throw 'Set ID self-test failed' }
-    Write-Host 'OK: bootstrap hash and set ID self-test'
+    if (Test-KitPath '05_System/scripts/../secrets.txt' -or -not (Test-KitPath '05_System/config/recovery.json')) { throw 'Kit path self-test failed' }
+    $sample = @([pscustomobject]@{id='old';tags=@('recovery-ready');time='2026-01-01T23:00:00Z'},
+                [pscustomobject]@{id='new';tags=@('recovery-ready');time='2026-01-02T09:00:00+09:00'},
+                [pscustomobject]@{id='other';tags=@('vault-daily');time='2026-01-03T00:00:00Z'})
+    if ((Select-LatestReady $sample).id -ne 'new') { throw 'Latest receipt self-test failed' }
+    if (Select-LatestReady @([pscustomobject]@{id='other';tags=@('vault-daily');time='2026-01-03T00:00:00Z'})) { throw 'Incomplete receipt self-test failed' }
+    Write-Host 'OK: bootstrap hash, kit path and latest receipt self-test'
     return
 }
 if (-not $ExpectedSha256) { throw 'ExpectedSha256 from the pinned recovery card is required' }
@@ -116,13 +131,8 @@ try {
     $snapshotsText = (& restic.exe --no-lock snapshots --json) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read restic snapshots' }
     $snapshots = $snapshotsText | ConvertFrom-Json
-    $ready = @()
-    foreach ($snapshot in $snapshots) {
-        if ($snapshot.tags -contains 'recovery-ready') { $ready += $snapshot }
-    }
-    $ready = @($ready | Sort-Object time -Descending)
-    if (-not $ready.Count) { throw 'No recovery-ready receipt snapshot exists' }
-    $receiptSnapshot = $ready[0]
+    $receiptSnapshot = Select-LatestReady $snapshots
+    if (-not $receiptSnapshot) { throw 'No recovery-ready receipt snapshot exists' }
     $receiptText = (& restic.exe --no-lock dump $receiptSnapshot.id recovery-receipt.json) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read recovery-ready receipt' }
     $receipt = $receiptText | ConvertFrom-Json
@@ -133,7 +143,7 @@ try {
         if ($receipt.$name -notmatch '^[a-f0-9]{64}$') { throw "Invalid recovery snapshot ID: $name" }
     }
     foreach ($file in $receipt.kit_sha256.PSObject.Properties.Name) {
-        if ($file -notmatch '^05_System/(?:config|scripts)/[A-Za-z0-9_./-]+$' -or $file -match '(^|/)\.\.(/|$)') {
+        if (-not (Test-KitPath $file)) {
             throw "Unsafe recovery kit path: $file"
         }
     }
